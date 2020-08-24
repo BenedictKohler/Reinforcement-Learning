@@ -1,0 +1,20 @@
+Purpose: This was the final project for the University of Alberta Reinforcement Learning Specializization on Coursera which I completed.
+
+Overview: The project involves building an Expected SARSA agent that is used to guide a virtual rocket to land within a randomly chosen zone.
+
+Environment:
+The rocket has a varying initial position, fuel level, velocity, and landing zone.
+
+Model:
+Given the current environment (state) the model computes the value of each action that can be taken. These action values are then 
+passed through a softmax function which returns the probability of each action being the best given the action values. Finally a
+random action is chosen based off of the probabilities computed by the softmax function.
+
+Rewards:
+If the rocket crashes or does not land within the desired zone then this triggers the end of an episode and is given a large negative
+reward. Otherwise we use temporal difference learning during the episode based on how much fuel the rocket consumed by taking a certain
+action.
+
+Other Information:
+An experience replay buffer is created to make better use of the data that we obtain after each interaction with the environment. As the state
+space is large, we use function approximation with a shallow neural network to find action-values given the state.
