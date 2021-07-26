@@ -1,0 +1,283 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from tqdm import tqdm
+from rl_glue import RLGlue
+from pendulum_env import PendulumEnvironment
+from agent import BaseAgent
+import plot_script
+import tiles3 as tc
+
+class PendulumTileCoder:
+    def __init__(self, iht_size=4096, num_tilings=32, num_tiles=8):
+        
+        self.num_tilings = num_tilings
+        self.num_tiles = num_tiles 
+        self.iht = tc.IHT(iht_size)
+    
+    def get_tiles(self, angle, ang_vel):
+        
+        ANGLE_MIN = - np.pi
+        ANGLE_MAX = np.pi
+        ANG_VEL_MIN = - 2 * np.pi
+        ANG_VEL_MAX = 2 * np.pi
+        
+        angle_scale = self.num_tiles / (ANGLE_MAX - ANGLE_MIN)
+        ang_vel_scale = self.num_tiles / (ANG_VEL_MAX - ANG_VEL_MIN)        
+        
+        tiles = tc.tileswrap(self.iht, self.num_tilings, [angle * angle_scale, ang_vel * ang_vel_scale], wrapwidths=[self.num_tiles, False])
+                    
+        return np.array(tiles)
+        
+def compute_softmax_prob(actor_w, tiles):
+
+    state_action_preferences = actor_w[:, tiles].sum(axis=1)
+    c = np.max(state_action_preferences)
+    numerator = np.exp(state_action_preferences - c)
+    denominator = np.sum(numerator)
+    softmax_prob = numerator / denominator
+
+    return softmax_prob
+
+# set tile-coder
+iht_size = 4096
+num_tilings = 8
+num_tiles = 8
+test_tc = PendulumTileCoder(iht_size=iht_size, num_tilings=num_tilings, num_tiles=num_tiles)
+
+num_actions = 3
+actions = list(range(num_actions))
+actor_w = np.zeros((len(actions), iht_size))
+
+# setting actor weights such that state-action preferences are always [-1, 1, 2]
+actor_w[0] = -1./num_tilings
+actor_w[1] = 1./num_tilings
+actor_w[2] = 2./num_tilings
+
+# obtain active_tiles from state
+state = [-np.pi, 0.]
+angle, ang_vel = state
+active_tiles = test_tc.get_tiles(angle, ang_vel)
+
+# compute softmax probability
+softmax_prob = compute_softmax_prob(actor_w, active_tiles)
+
+class ActorCriticSoftmaxAgent(BaseAgent): 
+    def __init__(self):
+        self.rand_generator = None
+        self.actor_step_size = None
+        self.critic_step_size = None
+        self.avg_reward_step_size = None
+        self.tc = None
+        self.avg_reward = None
+        self.critic_w = None
+        self.actor_w = None
+        self.actions = None
+        self.softmax_prob = None
+        self.prev_tiles = None
+        self.last_action = None
+    
+    def agent_init(self, agent_info={}):
+       
+        self.rand_generator = np.random.RandomState(agent_info.get("seed")) 
+
+        iht_size = agent_info.get("iht_size")
+        num_tilings = agent_info.get("num_tilings")
+        num_tiles = agent_info.get("num_tiles")
+
+        self.tc = PendulumTileCoder(iht_size=iht_size, num_tilings=num_tilings, num_tiles=num_tiles)
+
+        self.actor_step_size = agent_info.get("actor_step_size")/num_tilings
+        self.critic_step_size = agent_info.get("critic_step_size")/num_tilings
+        self.avg_reward_step_size = agent_info.get("avg_reward_step_size")
+
+        self.actions = list(range(agent_info.get("num_actions")))
+        self.avg_reward = 0.0
+        self.actor_w = np.zeros((len(self.actions), iht_size))
+        self.critic_w = np.zeros(iht_size)
+
+        self.softmax_prob = None
+        self.prev_tiles = None
+        self.last_action = None
+    
+    def agent_policy(self, active_tiles):
+        
+        # compute softmax probability
+        softmax_prob = compute_softmax_prob(self.actor_w, active_tiles)
+        
+        # Sample action from the softmax probability array
+        # self.rand_generator.choice() selects an element from the array with the specified probability
+        chosen_action = self.rand_generator.choice(self.actions, p=softmax_prob)
+        
+        # save softmax_prob as it will be useful later when updating the Actor
+        self.softmax_prob = softmax_prob
+        
+        return chosen_action
+
+    def agent_start(self, state):
+
+        angle, ang_vel = state
+
+        active_tiles = self.tc.get_tiles(angle, ang_vel)
+        current_action = self.agent_policy(active_tiles)
+
+        self.last_action = current_action
+        self.prev_tiles = np.copy(active_tiles)
+
+        return self.last_action
+
+
+    def agent_step(self, reward, state):
+
+        angle, ang_vel = state
+        active_tiles = self.tc.get_tiles(angle, ang_vel)
+
+        delta = reward - self.avg_reward + self.critic_w[active_tiles].sum() - self.critic_w[self.prev_tiles].sum()
+        self.avg_reward += self.avg_reward_step_size * delta
+        self.critic_w[self.prev_tiles] += self.critic_step_size * delta
+        
+        for a in self.actions:
+            if a == self.last_action:
+                self.actor_w[a][self.prev_tiles] += self.actor_step_size * delta * (1 - self.softmax_prob[a])
+            else:
+                self.actor_w[a][self.prev_tiles] += self.actor_step_size * delta * (0 - self.softmax_prob[a])
+
+        current_action = self.agent_policy(active_tiles)
+
+        self.prev_tiles = active_tiles
+        self.last_action = current_action
+
+        return self.last_action
+
+
+    def agent_message(self, message):
+        if message == 'get avg reward':
+            return self.avg_reward
+
+agent_info = {"iht_size": 4096,
+              "num_tilings": 8,
+              "num_tiles": 8,
+              "actor_step_size": 1e-1,
+              "critic_step_size": 1e-0,
+              "avg_reward_step_size": 1e-2,
+              "num_actions": 3,
+              "seed": 99}
+
+test_agent = ActorCriticSoftmaxAgent()
+test_agent.agent_init(agent_info)
+
+state = [-np.pi, 0.]
+
+test_agent.agent_start(state)
+
+env_info = {"seed": 99}
+agent_info = {"iht_size": 4096,
+              "num_tilings": 8,
+              "num_tiles": 8,
+              "actor_step_size": 1e-1,
+              "critic_step_size": 1e-0,
+              "avg_reward_step_size": 1e-2,
+              "num_actions": 3,
+              "seed": 99}
+
+test_env = PendulumEnvironment
+test_agent = ActorCriticSoftmaxAgent
+
+rl_glue = RLGlue(test_env, test_agent)
+rl_glue.rl_init(agent_info, env_info)
+rl_glue.rl_start()
+rl_glue.rl_step()
+
+def run_experiment(environment, agent, environment_parameters, agent_parameters, experiment_parameters):
+
+    rl_glue = RLGlue(environment, agent)
+            
+    # sweep agent parameters
+    for num_tilings in agent_parameters['num_tilings']:
+        for num_tiles in agent_parameters["num_tiles"]:
+            for actor_ss in agent_parameters["actor_step_size"]:
+                for critic_ss in agent_parameters["critic_step_size"]:
+                    for avg_reward_ss in agent_parameters["avg_reward_step_size"]:
+                        
+                        env_info = {}
+                        agent_info = {"num_tilings": num_tilings,
+                                      "num_tiles": num_tiles,
+                                      "actor_step_size": actor_ss,
+                                      "critic_step_size": critic_ss,
+                                      "avg_reward_step_size": avg_reward_ss,
+                                      "num_actions": agent_parameters["num_actions"],
+                                      "iht_size": agent_parameters["iht_size"]}            
+            
+                        # results to save
+                        return_per_step = np.zeros((experiment_parameters["num_runs"], experiment_parameters["max_steps"]))
+                        exp_avg_reward_per_step = np.zeros((experiment_parameters["num_runs"], experiment_parameters["max_steps"]))
+
+                        # using tqdm we visualize progress bars 
+                        for run in tqdm(range(1, experiment_parameters["num_runs"]+1)):
+                            env_info["seed"] = run
+                            agent_info["seed"] = run
+                
+                            rl_glue.rl_init(agent_info, env_info)
+                            rl_glue.rl_start()
+
+                            num_steps = 0
+                            total_return = 0.
+                            return_arr = []
+
+                            # exponential average reward without initial bias
+                            exp_avg_reward = 0.0
+                            exp_avg_reward_ss = 0.01
+                            exp_avg_reward_normalizer = 0
+
+                            while num_steps < experiment_parameters['max_steps']:
+                                num_steps += 1
+                                
+                                rl_step_result = rl_glue.rl_step()
+                                
+                                reward = rl_step_result[0]
+                                total_return += reward
+                                return_arr.append(reward)
+                                avg_reward = rl_glue.rl_agent_message("get avg reward")
+
+                                exp_avg_reward_normalizer = exp_avg_reward_normalizer + exp_avg_reward_ss * (1 - exp_avg_reward_normalizer)
+                                ss = exp_avg_reward_ss / exp_avg_reward_normalizer
+                                exp_avg_reward += ss * (reward - exp_avg_reward)
+                                
+                                return_per_step[run-1][num_steps-1] = total_return
+                                exp_avg_reward_per_step[run-1][num_steps-1] = exp_avg_reward
+                                                        
+                        if not os.path.exists('results'):
+                            os.makedirs('results')
+                
+                        save_name = "ActorCriticSoftmax_tilings_{}_tiledim_{}_actor_ss_{}_critic_ss_{}_avg_reward_ss_{}".format(num_tilings, num_tiles, actor_ss, critic_ss, avg_reward_ss)
+                        total_return_filename = "results/{}_total_return.npy".format(save_name)
+                        exp_avg_reward_filename = "results/{}_exp_avg_reward.npy".format(save_name)
+
+                        np.save(total_return_filename, return_per_step)
+                        np.save(exp_avg_reward_filename, exp_avg_reward_per_step)
+          
+    
+# Experiment parameters
+experiment_parameters = {
+    "max_steps" : 20000,
+    "num_runs" : 50
+}
+
+# Environment parameters
+environment_parameters = {}
+
+agent_parameters = {
+    "num_tilings": [32],
+    "num_tiles": [8],
+    "actor_step_size": [2**(-2)],
+    "critic_step_size": [2**1],
+    "avg_reward_step_size": [2**(-6)],
+    "num_actions": 3,
+    "iht_size": 4096
+}
+
+current_env = PendulumEnvironment
+current_agent = ActorCriticSoftmaxAgent
+
+run_experiment(current_env, current_agent, environment_parameters, agent_parameters, experiment_parameters)   
+    
